@@ -1,0 +1,35 @@
+#########################################################################
+#
+# Copyright (C) 2024 OSGeo
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+#########################################################################
+from rest_framework import serializers
+from geonode.resource.enumerator import ExecutionRequestAction as exa
+
+from geonode.base.models import ResourceBase
+from geonode.upload.api.serializer import BaseImporterSerializer
+
+
+class MetadataFileSerializer(BaseImporterSerializer):
+    class Meta:
+        ref_name = "MetadataFileSerializer"
+        model = ResourceBase
+        view_name = "importer_upload"
+        fields = ("resource_pk", "base_file", "action")
+
+    base_file = serializers.FileField()
+    resource_pk = serializers.IntegerField(required=True)
+    action = serializers.CharField(required=False, default=exa.UPLOAD.value)

@@ -1,0 +1,964 @@
+#########################################################################
+#
+# Copyright (C) 2021 OSGeo
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+#########################################################################
+
+import copy
+import json
+import logging
+import pprint
+import jsonschema
+import collections
+
+from avatar.templatetags.avatar_tags import avatar_url
+from guardian.shortcuts import get_group_perms, get_anonymous_user
+
+from django.conf import settings
+from django.contrib.auth.models import Group
+from django.contrib.auth import get_user_model
+from geonode.utils import build_absolute_uri
+from geonode.groups.conf import settings as groups_settings
+
+logger = logging.getLogger(__name__)
+
+
+"""
+Permissions will be managed according to a "compact" set:
+
+ - view: view resource
+ - download: view and download
+ - edit: view download and edit (metadata, style, data)
+ - manage: change permissions, delete resource, etc.
+
+The GET method will return:
+
+users:
+ - username
+ - first name
+ - last name
+ - permissions (view | download | edit | manage)
+
+organizations:
+ - title
+ - name
+ - permissions (view | download | edit | manage)
+
+groups:
+ - title
+ - name
+ - permissions (view | download | edit | manage)
+
+"""
+
+# Permissions mapping
+PERMISSIONS = {
+    "add_resourcebase": "add_resource",
+}
+
+DOWNLOADABLE_RESOURCES = ["dataset", "document"]
+
+DATA_EDITABLE_RESOURCES_SUBTYPES = ["vector", "vector_time", "remote"]
+
+DATA_STYLABLE_RESOURCES_SUBTYPES = ["raster", "vector", "vector_time"]
+
+# The following permissions will be filtered out when READ_ONLY mode is active
+READ_ONLY_AFFECTED_PERMISSIONS = [
+    "add_resource",
+]
+
+# Permissions on resources
+VIEW_PERMISSIONS = [
+    "view_resourcebase",
+]
+
+DOWNLOAD_PERMISSIONS = [
+    "download_resourcebase",
+]
+
+EDIT_PERMISSIONS = [
+    "change_resourcebase",
+    "change_resourcebase_metadata",
+]
+
+BASIC_MANAGE_PERMISSIONS = [
+    "delete_resourcebase",
+    "change_resourcebase_permissions",
+]
+
+MANAGE_PERMISSIONS = BASIC_MANAGE_PERMISSIONS + [
+    "publish_resourcebase",
+]
+
+ADMIN_PERMISSIONS = MANAGE_PERMISSIONS + EDIT_PERMISSIONS
+
+OWNER_PERMISSIONS = ADMIN_PERMISSIONS + VIEW_PERMISSIONS
+
+DATASET_EDIT_DATA_PERMISSIONS = [
+    "change_dataset_data",
+]
+DATASET_EDIT_STYLE_PERMISSIONS = [
+    "change_dataset_style",
+]
+DATASET_ADMIN_PERMISSIONS = DATASET_EDIT_DATA_PERMISSIONS + DATASET_EDIT_STYLE_PERMISSIONS
+
+SERVICE_PERMISSIONS = ["add_service", "delete_service", "change_resourcebase_metadata", "add_resourcebase_from_service"]
+
+NONE_RIGHTS = "none"
+VIEW_RIGHTS = "view"
+DOWNLOAD_RIGHTS = "download"
+EDIT_RIGHTS = "edit"
+MANAGE_RIGHTS = "manage"
+OWNER_RIGHTS = "owner"
+
+COMPACT_RIGHT_MODES = (
+    (VIEW_RIGHTS, "view"),
+    (DOWNLOAD_RIGHTS, "download"),
+    (EDIT_RIGHTS, "edit"),
+    (MANAGE_RIGHTS, "manage"),
+    (OWNER_RIGHTS, "owner"),
+)
+
+VALID_ANONYMOUS_COMPACT_PERMISSIONS = {VIEW_RIGHTS, DOWNLOAD_RIGHTS, NONE_RIGHTS}
+VALID_REGISTERED_MEMBERS_COMPACT_PERMISSIONS = {VIEW_RIGHTS, DOWNLOAD_RIGHTS, EDIT_RIGHTS, MANAGE_RIGHTS, NONE_RIGHTS}
+
+
+def _normalize_compact_permission(raw_value, valid_values, setting_name):
+    """
+    Normalize a compact permission value against the allowed set.
+
+    `valid_values` is caller-provided and defines which compact values are
+    accepted for the specific setting (e.g. anonymous vs registered-members).
+    Returns normalized lowercase value when valid, otherwise None.
+    """
+    if raw_value is None:
+        return None
+    normalized_value = str(raw_value).strip().lower()
+    if normalized_value in ("", NONE_RIGHTS):
+        return None
+    if normalized_value not in valid_values:
+        logger.warning(
+            "%s contains unsupported value '%s'. Defaulting to 'none'.",
+            setting_name,
+            normalized_value,
+        )
+        return None
+    return normalized_value
+
+
+def get_default_anonymous_compact_permission():
+    """
+    Resolve the default anonymous compact permission from settings.
+
+    Reads DEFAULT_ANONYMOUS_PERMISSIONS and returns a normalized compact
+    value (e.g. "view", "download") or None when unset/none/invalid.
+    """
+    raw_value = getattr(settings, "DEFAULT_ANONYMOUS_PERMISSIONS", None)
+    if raw_value is None:
+        return None
+    return _normalize_compact_permission(
+        raw_value,
+        VALID_ANONYMOUS_COMPACT_PERMISSIONS,
+        "DEFAULT_ANONYMOUS_PERMISSIONS",
+    )
+
+
+def get_default_registered_members_compact_permission():
+    """
+    Resolve the default registered-members compact permission from settings.
+
+    Reads DEFAULT_REGISTERED_MEMBERS_PERMISSIONS and returns a normalized
+    compact value (e.g. "view", "download", "edit", "manage") or None
+    when unset/none/invalid.
+    """
+    raw_value = getattr(settings, "DEFAULT_REGISTERED_MEMBERS_PERMISSIONS", None)
+    if raw_value is None:
+        return None
+    return _normalize_compact_permission(
+        raw_value,
+        VALID_REGISTERED_MEMBERS_COMPACT_PERMISSIONS,
+        "DEFAULT_REGISTERED_MEMBERS_PERMISSIONS",
+    )
+
+
+def get_default_anonymous_permissions_list():
+    compact_perm = get_default_anonymous_compact_permission()
+    if compact_perm == VIEW_RIGHTS:
+        return VIEW_PERMISSIONS
+    if compact_perm == DOWNLOAD_RIGHTS:
+        return VIEW_PERMISSIONS + DOWNLOAD_PERMISSIONS
+    return []
+
+
+DEFAULT_PERMISSIONS = get_default_anonymous_permissions_list()
+DEFAULT_PERMS_SPEC = json.dumps({"users": {"AnonymousUser": DEFAULT_PERMISSIONS}, "groups": {}})
+
+PERM_SPEC_COMPACT_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "type": "object",
+    "properties": {
+        "users": {
+            "type": "array",
+            "items": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "avatar": {"type": "string"},
+                        "first_name": {"type": "string"},
+                        "id": {"type": "integer"},
+                        "last_name": {"type": "string"},
+                        "permissions": {
+                            "type": "string",
+                            "enum": ["none", "view", "download", "edit", "manage", "owner"],
+                        },
+                        "username": {"type": "string"},
+                        "is_staff": {"type": "boolean"},
+                        "is_superuser": {"type": "boolean"},
+                    },
+                    "required": [
+                        "avatar",
+                        "first_name",
+                        "id",
+                        "last_name",
+                        "permissions",
+                        "username",
+                        "is_staff",
+                        "is_superuser",
+                    ],
+                }
+            ],
+        },
+        "organizations": {
+            "type": "array",
+            "items": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "name": {"type": "string"},
+                        "permissions": {
+                            "type": "string",
+                            "enum": ["none", "view", "download", "edit", "manage", "owner"],
+                        },
+                        "title": {"type": "string"},
+                    },
+                    "required": ["id", "name", "permissions", "title"],
+                }
+            ],
+        },
+        "groups": {
+            "type": "array",
+            "items": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "title": {"type": "string"},
+                        "name": {"type": "string"},
+                        "permissions": {
+                            "type": "string",
+                            "enum": ["none", "view", "download", "edit", "manage", "owner"],
+                        },
+                    },
+                    "required": ["id", "title", "name", "permissions"],
+                }
+            ],
+        },
+    },
+    "required": ["users", "organizations", "groups"],
+}
+
+
+def _to_extended_perms(
+    perm: str, resource_type: str = None, resource_subtype: str = None, is_owner: bool = False
+) -> list:
+    """Explode "compact" permissions into an "extended" set, accordingly to the schema below:
+
+    - view: view resource
+    - download: view and download
+    - edit: view download and edit (metadata, style, data)
+    - manage: change permissions, delete resource, etc.
+    - owner: admin permissions
+    """
+
+    def safe_list(perms):
+        return sorted(list(set(copy.deepcopy(perms)))) if perms else []
+
+    if is_owner:
+        if resource_type and resource_type.lower() in DOWNLOADABLE_RESOURCES:
+            if resource_subtype and resource_subtype.lower() in safe_list(
+                DATA_EDITABLE_RESOURCES_SUBTYPES + DATA_STYLABLE_RESOURCES_SUBTYPES
+            ):
+                return safe_list(DATASET_ADMIN_PERMISSIONS + OWNER_PERMISSIONS + DOWNLOAD_PERMISSIONS)
+            else:
+                return safe_list(OWNER_PERMISSIONS + DOWNLOAD_PERMISSIONS)
+        else:
+            return safe_list(OWNER_PERMISSIONS)
+    elif perm is None or len(perm) == 0 or perm == NONE_RIGHTS:
+        return []
+    elif perm == VIEW_RIGHTS:
+        return safe_list(VIEW_PERMISSIONS)
+    elif perm == DOWNLOAD_RIGHTS:
+        if resource_type and resource_type.lower() in DOWNLOADABLE_RESOURCES:
+            return safe_list(VIEW_PERMISSIONS + DOWNLOAD_PERMISSIONS)
+        else:
+            return safe_list(VIEW_PERMISSIONS)
+    elif perm == EDIT_RIGHTS:
+        if resource_type and resource_type.lower() in DOWNLOADABLE_RESOURCES:
+            if resource_subtype and resource_subtype.lower() in safe_list(
+                DATA_EDITABLE_RESOURCES_SUBTYPES + DATA_STYLABLE_RESOURCES_SUBTYPES
+            ):
+                return safe_list(DATASET_ADMIN_PERMISSIONS + VIEW_PERMISSIONS + EDIT_PERMISSIONS + DOWNLOAD_PERMISSIONS)
+            else:
+                return safe_list(VIEW_PERMISSIONS + EDIT_PERMISSIONS + DOWNLOAD_PERMISSIONS)
+        else:
+            return safe_list(VIEW_PERMISSIONS + EDIT_PERMISSIONS)
+    elif perm == MANAGE_RIGHTS:
+        if resource_type and resource_type.lower() in DOWNLOADABLE_RESOURCES:
+            if resource_subtype and resource_subtype.lower() in safe_list(
+                DATA_EDITABLE_RESOURCES_SUBTYPES + DATA_STYLABLE_RESOURCES_SUBTYPES
+            ):
+                return safe_list(
+                    DATASET_ADMIN_PERMISSIONS + VIEW_PERMISSIONS + ADMIN_PERMISSIONS + DOWNLOAD_PERMISSIONS
+                )
+            else:
+                return safe_list(VIEW_PERMISSIONS + ADMIN_PERMISSIONS + DOWNLOAD_PERMISSIONS)
+        else:
+            return safe_list(VIEW_PERMISSIONS + ADMIN_PERMISSIONS)
+
+
+def _to_compact_perms(
+    perms: list, resource_type: str = None, resource_subtype: str = None, is_owner: bool = False
+) -> str:
+    """Compress standard permissions into a "compact" set, accordingly to the schema below:
+
+    - view: view resource
+    - download: view and download
+    - edit: view download and edit (metadata, style, data)
+    - manage: change permissions, delete resource, etc.
+    - owner: admin permissions
+    """
+    if is_owner:
+        return OWNER_RIGHTS
+    if perms is None or len(perms) == 0:
+        return NONE_RIGHTS
+    if any(_p in MANAGE_PERMISSIONS for _p in perms):
+        return MANAGE_RIGHTS
+    elif (
+        resource_type
+        and resource_type.lower() in DOWNLOADABLE_RESOURCES
+        and any(_p in DATASET_ADMIN_PERMISSIONS + EDIT_PERMISSIONS for _p in perms)
+    ):
+        return EDIT_RIGHTS
+    elif any(_p in DATASET_ADMIN_PERMISSIONS + EDIT_PERMISSIONS for _p in perms):
+        return EDIT_RIGHTS
+    elif (
+        resource_type
+        and resource_type.lower() in DOWNLOADABLE_RESOURCES
+        and any(_p in DOWNLOAD_PERMISSIONS for _p in perms)
+    ):
+        return DOWNLOAD_RIGHTS
+    elif any(_p in VIEW_PERMISSIONS for _p in perms):
+        return VIEW_RIGHTS
+    return NONE_RIGHTS
+
+
+_Binding = collections.namedtuple("Binding", ["name", "expected", "ro", "binding"])
+
+_User = collections.namedtuple(
+    "User", ["id", "username", "last_name", "first_name", "avatar", "is_superuser", "is_staff"]
+)
+
+_Group = collections.namedtuple("Group", ["id", "title", "name", "logo"])
+
+
+def _binding(name, expected=True, ro=True, binding=None):
+    return _Binding(name, expected, ro, binding)
+
+
+class BindingFailed(Exception):
+    """Something in the API has changed"""
+
+    pass
+
+
+class PermSpecConverterBase(object):
+    _object_name = None
+
+    def __init__(self, json, resource, parent=None):
+        self._resource = resource
+        self._parent = parent
+        if parent == self:
+            raise Exception("bogus")
+        if json is not None:
+            self._bind_json(json)
+
+    def _bind_json(self, json):
+        # generally, not required for override. instead use _bind_custom_json
+        # if possible
+        if not isinstance(json, dict):
+            self._binding_failed("expected dict, got %s", type(json))
+        # ``pop`` below mutates this dict; copy so callers (and any
+        # caller-owned references via shared list items) stay intact. Each
+        # recursive ``_bind_json`` call does the same for its own input, so a
+        # shallow copy at every level is sufficient.
+        json = dict(json)
+        for binding in self._bindings:
+            val = json.pop(binding.name, None)
+            if binding.expected and val is None:
+                self._binding_failed("expected val for %s", binding.name)
+            if binding.binding and val is not None:
+                if issubclass(binding.binding, PermSpecConverterBase):
+                    if isinstance(val, list):
+                        val = [binding.binding(v, getattr(self, "_resource", None), parent=self) for v in val]
+                    else:
+                        val = binding.binding(val, getattr(self, "_resource", None), parent=self)
+                else:
+                    if isinstance(val, list):
+                        val = [binding.binding(v, parent=self) for v in val]
+                    else:
+                        val = binding.binding(val, parent=self)
+            setattr(self, binding.name, val)
+        self._bind_custom_json(json)
+
+    def _bind_custom_json(self, json):
+        # do any custom binding like for a shortcut
+        pass
+
+    def _binding_failed(self, msg, args):
+        raise BindingFailed(f"[{type(self)}] {msg % args}")
+
+    def _to_json_object(self, deep=True, top_level=True):
+        _json = {}
+        for binding in self._bindings:
+            val = getattr(self, binding.name, None)
+            if isinstance(val, PermSpecConverterBase):
+                val = val._to_json_object(top_level=False)
+            if val is not None:
+                _json[binding.name] = val
+        self._to_json_object_custom(_json)
+        if top_level and self._object_name:
+            _json = {self._object_name: _json}
+        return _json.copy()
+
+    def _to_json_object_custom(self, json):
+        pass
+
+    def __repr__(self):
+        _json = self._to_json_object(deep=True, top_level=False)
+        try:
+            return json.dumps(_json)
+        except Exception:
+            return pprint.pformat(_json, indent=2)
+
+
+class PermSpec(PermSpecConverterBase):
+    _object_name = "perm_spec"
+    _bindings = (
+        _binding("users"),
+        _binding("groups"),
+    )
+
+    @property
+    def compact(self):
+        """Converts a standard and verbose 'perm_spec' into 'compact mode'.
+
+         - The method also recognizes special/internal security groups, like 'anonymous' and 'registered-members' and places
+           their permissions on a specific node called 'groups'.
+         - Every security group, different from the former ones, associated to a GeoNode 'GroupProfile', will be placed on a
+           node called 'organizations' instead.
+        e.g.:
+
+        ```
+        {
+            "users": [
+                {
+                    "id": 1001,
+                    "username": "afabiani",
+                    "first_name": "",
+                    "last_name": "",
+                    "avatar": "",
+                    "permissions": "manage",
+                    "is_superuser": <bool>,
+                    "is_staff": <bool>
+                }
+            ],
+            "organizations": [],
+            "groups": [
+                {
+                    "id": 3,
+                    "title": "Registered Members",
+                    "name": "registered-members",
+                    "permissions": "edit"
+                },
+                {
+                    "id": 2,
+                    "title": "anonymous",
+                    "name": "anonymous",
+                    "permissions": "download"
+                }
+            ]
+        }
+        ```
+        """
+        json = {}
+        user_perms = []
+        group_perms = []
+        anonymous_perms = None
+        contributors_perms = None
+        organization_perms = []
+
+        for _k in self.users:
+            _perms = self.users[_k]
+            if isinstance(_k, str):
+                _k = get_user_model().objects.get(username=_k)
+            if not _k.is_anonymous and _k.username != "AnonymousUser":
+                avatar = build_absolute_uri(avatar_url(_k, 240))
+                user = _User(_k.id, _k.username, _k.last_name, _k.first_name, avatar, _k.is_superuser, _k.is_staff)
+                is_owner = _k == self._resource.owner
+                user_perms.append(
+                    {
+                        "id": user.id,
+                        "username": user.username,
+                        "first_name": user.first_name,
+                        "last_name": user.last_name,
+                        "avatar": user.avatar,
+                        "permissions": _to_compact_perms(
+                            _perms, self._resource.resource_type, self._resource.subtype, is_owner
+                        ),
+                        "is_superuser": user.is_superuser,
+                        "is_staff": user.is_staff,
+                    }
+                )
+            else:
+                anonymous_perms = {
+                    "id": Group.objects.get(name="anonymous").id,
+                    "title": "anonymous",
+                    "name": "anonymous",
+                    "permissions": _to_compact_perms(_perms, self._resource.resource_type, self._resource.subtype),
+                }
+        # Let's make sure we don't lose control over the resource
+        if not any([_u.get("id", None) == self._resource.owner.id for _u in user_perms]):
+            user_perms.append(
+                {
+                    "id": self._resource.owner.id,
+                    "username": self._resource.owner.username,
+                    "first_name": self._resource.owner.first_name,
+                    "last_name": self._resource.owner.last_name,
+                    "avatar": build_absolute_uri(avatar_url(self._resource.owner, 240)),
+                    "permissions": OWNER_RIGHTS,
+                    "is_superuser": self._resource.owner.is_superuser,
+                    "is_staff": self._resource.owner.is_staff,
+                }
+            )
+        for user in get_user_model().objects.filter(is_superuser=True):
+            if not any([_u.get("id", None) == user.id for _u in user_perms]):
+                user_perms.append(
+                    {
+                        "id": user.id,
+                        "username": user.username,
+                        "first_name": user.first_name,
+                        "last_name": user.last_name,
+                        "avatar": build_absolute_uri(avatar_url(user, 240)),
+                        "permissions": MANAGE_RIGHTS,
+                        "is_superuser": user.is_superuser,
+                        "is_staff": user.is_staff,
+                    }
+                )
+
+        for _k in self.groups:
+            _perms = self.groups[_k]
+            if isinstance(_k, str):
+                _k = Group.objects.get(name=_k)
+            if _k.name == "anonymous":
+                anonymous_perms = {
+                    "id": _k.id,
+                    "title": "anonymous",
+                    "name": "anonymous",
+                    "permissions": _to_compact_perms(_perms, self._resource.resource_type, self._resource.subtype),
+                }
+            elif hasattr(_k, "groupprofile"):
+                group = _Group(_k.id, _k.groupprofile.title, _k.name, _k.groupprofile.logo_url)
+                if _k.name == groups_settings.REGISTERED_MEMBERS_GROUP_NAME:
+                    contributors_perms = {
+                        "id": group.id,
+                        "title": group.title,
+                        "name": group.name,
+                        "permissions": _to_compact_perms(_perms, self._resource.resource_type, self._resource.subtype),
+                    }
+                else:
+                    organization_perms.append(
+                        {
+                            "id": group.id,
+                            "title": group.title,
+                            "name": group.name,
+                            "logo": group.logo,
+                            "permissions": _to_compact_perms(
+                                _perms, self._resource.resource_type, self._resource.subtype
+                            ),
+                        }
+                    )
+
+        if anonymous_perms:
+            group_perms.append(anonymous_perms)
+        else:
+            anonymous_group = Group.objects.get(name="anonymous")
+            group_perms.append(
+                {
+                    "id": anonymous_group.id,
+                    "title": "anonymous",
+                    "name": "anonymous",
+                    "permissions": _to_compact_perms(
+                        get_group_perms(anonymous_group, self._resource),
+                        self._resource.resource_type,
+                        self._resource.subtype,
+                    ),
+                }
+            )
+        if contributors_perms:
+            group_perms.append(contributors_perms)
+        elif Group.objects.filter(name=groups_settings.REGISTERED_MEMBERS_GROUP_NAME).exists():
+            contributors_group = Group.objects.get(name=groups_settings.REGISTERED_MEMBERS_GROUP_NAME)
+            group_perms.append(
+                {
+                    "id": contributors_group.id,
+                    "title": "Registered Members",
+                    "name": contributors_group.name,
+                    "permissions": _to_compact_perms(
+                        get_group_perms(contributors_group, self._resource),
+                        self._resource.resource_type,
+                        self._resource.subtype,
+                    ),
+                }
+            )
+
+        json["users"] = sorted(user_perms, key=lambda x: x["id"], reverse=True)
+        json["organizations"] = sorted(organization_perms, key=lambda x: x["id"], reverse=True)
+        json["groups"] = sorted(group_perms, key=lambda x: x["id"], reverse=True)
+        return json.copy()
+
+
+class PermSpecUserCompact(PermSpecConverterBase):
+    _object_name = "perm_spec_user_compact"
+    _bindings = (
+        _binding("id"),
+        _binding("username", expected=False),
+        _binding("first_name", expected=False),
+        _binding("last_name", expected=False),
+        _binding("avatar", expected=False),
+        _binding("permissions"),
+        _binding("is_superuser", expected=False),
+        _binding("is_staff", expected=False),
+    )
+
+
+class PermSpecGroupCompact(PermSpecConverterBase):
+    _object_name = "perm_spec_group_compact"
+    _bindings = (
+        _binding("id"),
+        _binding("title", expected=False),
+        _binding("name", expected=False),
+        _binding("logo", expected=False),
+        _binding("permissions"),
+    )
+
+
+class PermSpecCompact(PermSpecConverterBase):
+    _object_name = "perm_spec_compact"
+    _bindings = (
+        _binding("users", expected=False, binding=PermSpecUserCompact),
+        _binding("organizations", expected=False, binding=PermSpecGroupCompact),
+        _binding("groups", expected=False, binding=PermSpecGroupCompact),
+    )
+
+    @classmethod
+    def validate(cls, perm_spec):
+        try:
+            jsonschema.validate(perm_spec, PERM_SPEC_COMPACT_SCHEMA)
+            return True
+        except jsonschema.ValidationError:
+            return False
+
+    @property
+    def extended(self):
+        """Converts a 'perm_spec' in 'compact mode' into standard and verbose one.
+
+        e.g.:
+
+        ```
+        {
+            'groups': {
+                <Group: registered-members>: ['view_resourcebase',
+                                             'download_resourcebase',
+                                             'change_resourcebase'],
+                <Group: anonymous>: ['view_resourcebase']
+            },
+            'users': {
+                <Profile: AnonymousUser>: ['view_resourcebase'],
+                <Profile: afabiani>: ['view_resourcebase',
+                                    'download_resourcebase',
+                                    'change_resourcebase_metadata',
+                                    'change_resourcebase',
+                                    'delete_resourcebase',
+                                    'change_resourcebase_permissions',
+                                    'publish_resourcebase']
+            }
+        }
+        ```
+        """
+        json = {"users": {}, "groups": {}}
+        for _u in self.users:
+            _user_profile = get_user_model().objects.get(id=_u.id)
+            _is_owner = _user_profile == self._resource.owner
+            _perms = OWNER_RIGHTS if _is_owner else MANAGE_RIGHTS if _user_profile.is_superuser else _u.permissions
+            json["users"][_user_profile.username] = _to_extended_perms(
+                _perms, self._resource.resource_type, self._resource.subtype, _is_owner
+            )
+        for _go in self.organizations:
+            _group = Group.objects.get(id=_go.id)
+            json["groups"][_group.name] = _to_extended_perms(
+                _go.permissions, self._resource.resource_type, self._resource.subtype
+            )
+        for _go in self.groups:
+            _group = Group.objects.get(id=_go.id)
+            json["groups"][_group.name] = _to_extended_perms(
+                _go.permissions, self._resource.resource_type, self._resource.subtype
+            )
+            if _go.name == "anonymous":
+                _user_profile = get_anonymous_user()
+                json["users"][_user_profile.username] = _to_extended_perms(
+                    _go.permissions, self._resource.resource_type, self._resource.subtype
+                )
+        return json.copy()
+
+    def diff(self, other: "PermSpecCompact") -> "PermSpecCompactDiff":
+        """Compute the differences between ``self`` and ``other``.
+
+        ``self`` is treated as the current state and ``other`` as the proposed
+        one. Returns a :class:`PermSpecCompactDiff` describing the mutations
+        needed to move from ``self`` to ``other``, bucketed by
+        ``users`` / ``organizations`` / ``groups``:
+
+        - ``added``   — entries present in ``other`` but not in ``self``.
+        - ``removed`` — entries present in ``self`` but not in ``other``.
+        - ``changed`` — entries present in both with a different ``permissions``
+          value; each item carries ``from`` and ``to`` to describe the
+          transition.
+
+        Entities are matched by ``id``. ``"none"`` is treated as a permission
+        value, not as absence — callers wanting to collapse it to a removal
+        can post-process the result.
+        """
+
+        # Index each bucket's entries by id so membership/lookup is O(1).
+        # Duplicate ids in the same bucket are first-wins (matches merge()).
+        def _index(entries):
+            indexed = {}
+            for entry in entries or []:
+                entry_id = getattr(entry, "id", None)
+                if entry_id is None or entry_id in indexed:
+                    continue
+                indexed[entry_id] = entry
+            return indexed
+
+        # Serialize an indexed entry back to its dict form for the diff payload.
+        def _payload(entry):
+            return entry._to_json_object(top_level=False)
+
+        buckets = {}
+        # Iterate the same buckets the compact spec already defines
+        # (users / organizations / groups), driven by _bindings so the diff
+        # stays in lockstep with the schema.
+        for bucket in (b.name for b in self._bindings):
+            current = _index(getattr(self, bucket, None))
+            proposed = _index(getattr(other, bucket, None))
+
+            # Set algebra over ids gives us the three mutation kinds in one shot:
+            #   added   = proposed \ current   (ids only in other)
+            #   removed = current  \ proposed  (ids only in self)
+            #   changed = proposed ∩ current   (ids in both, filtered by perm)
+            # "none" is a legal permission value, not absence — equal perms on
+            # both sides (including "none" == "none") yield no entry at all.
+            added = [_payload(proposed[i]) for i in proposed.keys() - current.keys()]
+            removed = [_payload(current[i]) for i in current.keys() - proposed.keys()]
+            changed = []
+            for entry_id in current.keys() & proposed.keys():
+                before = current[entry_id].permissions
+                after = proposed[entry_id].permissions
+                if before == after:
+                    continue
+                # Build the changed entry from the proposed side (so identifier
+                # fields reflect the latest values), then replace the single
+                # "permissions" key with the explicit from/to transition —
+                # validators downstream need direction, not just the new value.
+                payload = _payload(proposed[entry_id])
+                payload.pop("permissions", None)
+                payload["from"] = before
+                payload["to"] = after
+                changed.append(payload)
+
+            buckets[bucket] = {"added": added, "removed": removed, "changed": changed}
+        return PermSpecCompactDiff(**buckets)
+
+    def merge(self, perm_spec_compact_patch: "PermSpecCompact"):
+        """Merges 'perm_spec_compact_patch' to the current one.
+
+        - Existing elements will be overridden.
+        - Non existing elements will be added.
+        - If you need to delete elements you cannot use this method.
+        """
+        for _elem in [_b.name for _b in self._bindings]:
+            for _up in getattr(perm_spec_compact_patch, _elem, []) or []:
+                _merged = False
+                for _i, _u in enumerate(getattr(self, _elem, []) or []):
+                    if _up.id == _u.id:
+                        getattr(self, _elem)[_i] = _up
+                        getattr(self, _elem)[_i].parent = self
+                        _merged = True
+                        break
+                if not _merged:
+                    if isinstance(getattr(self, _elem), list):
+                        getattr(self, _elem).append(_up)
+                    else:
+                        getattr(self, _elem).add(_up)
+
+
+class PermSpecCompactDiff:
+    """Structured result of diffing two ``PermSpecCompact`` instances.
+
+    The diff is bucketed (``users`` / ``organizations`` / ``groups``); each
+    bucket carries ``added`` / ``removed`` / ``changed`` lists describing the
+    mutations needed to move from a current to a proposed state. ``added`` and
+    ``removed`` items are full compact entries (with ``permissions``);
+    ``changed`` items carry identifying fields plus ``from`` / ``to`` to
+    describe the permission transition.
+
+    See :meth:`PermSpecCompact.diff` for how an instance is produced and
+    :meth:`apply` for how to materialize the result onto a current compact
+    spec.
+    """
+
+    _BUCKETS = ("users", "organizations", "groups")
+
+    def __init__(self, users=None, organizations=None, groups=None):
+        self.users = self._normalize_bucket(users)
+        self.organizations = self._normalize_bucket(organizations)
+        self.groups = self._normalize_bucket(groups)
+
+    @staticmethod
+    def _normalize_bucket(bucket):
+        bucket = bucket or {}
+        return {
+            "added": list(bucket.get("added", []) or []),
+            "removed": list(bucket.get("removed", []) or []),
+            "changed": list(bucket.get("changed", []) or []),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        data = data or {}
+        return cls(
+            users=data.get("users"),
+            organizations=data.get("organizations"),
+            groups=data.get("groups"),
+        )
+
+    def to_dict(self):
+        return {bucket: dict(getattr(self, bucket)) for bucket in self._BUCKETS}
+
+    def is_empty(self):
+        for bucket in self._BUCKETS:
+            entries = getattr(self, bucket)
+            if entries["added"] or entries["removed"] or entries["changed"]:
+                return False
+        return True
+
+    def apply(self, current_perms_compact, resource) -> "PermSpecCompact":
+        """Materialize the diff on top of a current compact spec.
+
+        ``current_perms_compact`` is the dict-shaped compact spec to start
+        from; ``resource`` is the target resource (used by the underlying
+        ``PermSpecCompact`` constructor). Within each bucket: ``removed``
+        entries are dropped by id, ``changed`` entries update the
+        ``permissions`` of existing entries (matched by id), and ``added``
+        entries are appended (replacing any pre-existing entry with the same
+        id so the operation is idempotent against stale diffs).
+        """
+        result = PermSpecCompact(current_perms_compact, resource)
+        binding_cls_by_bucket = {b.name: b.binding for b in result._bindings}
+
+        for bucket, binding_cls in binding_cls_by_bucket.items():
+            bucket_diff = getattr(self, bucket)
+            entries = getattr(result, bucket, None) or []
+            setattr(result, bucket, entries)
+
+            removed_ids = {e["id"] for e in bucket_diff["removed"] if e.get("id") is not None}
+            if removed_ids:
+                entries[:] = [e for e in entries if e.id not in removed_ids]
+
+            change_map = {e["id"]: e["to"] for e in bucket_diff["changed"] if e.get("id") is not None}
+            if change_map:
+                for e in entries:
+                    if e.id in change_map:
+                        e.permissions = change_map[e.id]
+
+            added_ids = {new.get("id") for new in bucket_diff["added"] if new.get("id") is not None}
+            if added_ids:
+                entries[:] = [e for e in entries if e.id not in added_ids]
+            for new in bucket_diff["added"]:
+                if new.get("id") is not None:
+                    entries.append(binding_cls(new, resource, parent=result))
+
+        return result
+
+    def __repr__(self):
+        return f"PermSpecCompactDiff({self.to_dict()!r})"
+
+
+def get_compact_perms_list(
+    perms: list,
+    resource_type: str = None,
+    resource_subtype: str = None,
+    is_owner: bool = False,
+    is_none_allowed: bool = True,
+    compact_perms_labels: dict = {},
+) -> list:
+    """
+    Transforms an extended "perm_spec" into a list of compact perms.
+    """
+
+    def _get_labeled_compact_perm(compact_perm: str):
+        return {"name": compact_perm, "label": compact_perms_labels.get(compact_perm, compact_perm)}
+
+    _perms_list = []
+    _perm = _to_compact_perms(perms, resource_type, resource_subtype, is_owner)
+    if _perm:
+        for _p in COMPACT_RIGHT_MODES:
+            if (
+                _p[1] not in [DOWNLOAD_RIGHTS] + DATASET_ADMIN_PERMISSIONS
+                or _p[1] in [DOWNLOAD_RIGHTS]
+                and any(__p in DOWNLOAD_PERMISSIONS for __p in perms)
+                or _p[1] in DATASET_ADMIN_PERMISSIONS
+                and any(__p in DATA_EDITABLE_RESOURCES_SUBTYPES + DATA_STYLABLE_RESOURCES_SUBTYPES for __p in perms)
+            ):
+                _perms_list.append(_get_labeled_compact_perm(_p[1]))
+                if _p[1] == _perm:
+                    break
+    if is_owner and OWNER_RIGHTS not in _perms_list:
+        _perms_list.append(_get_labeled_compact_perm(OWNER_RIGHTS))
+    if is_none_allowed and NONE_RIGHTS not in _perms_list:
+        _perms_list.insert(0, _get_labeled_compact_perm(NONE_RIGHTS))
+    return _perms_list

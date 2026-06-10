@@ -1,0 +1,56 @@
+[
+   {
+      "model":"maps.map",
+      "pk":1002,
+      "fields":{
+         "title":"theaters_nyc_map",
+         "abstract":"",
+         "purpose":null,
+         "constraints_other":null,
+         "supplemental_information":"No information provided",
+         "data_quality_statement":null,
+         "last_modified":"2021-03-08T11:21:01.939Z",
+         "urlsuffix":"",
+         "featuredurl":"",
+         "tkeywords":[
+
+         ],
+         "regions":[
+
+         ],
+         "users_geolimits":[
+
+         ],
+         "groups_geolimits":[
+
+         ]
+      }
+   },
+   {
+      "model":"maps.map",
+      "pk":1009,
+      "fields":{
+         "title":"composition_map",
+         "abstract":"",
+         "purpose":null,
+         "constraints_other":null,
+         "supplemental_information":"No information provided",
+         "data_quality_statement":null,
+         "last_modified":"2021-03-08T12:24:40.621Z",
+         "urlsuffix":"",
+         "featuredurl":"",
+         "tkeywords":[
+
+         ],
+         "regions":[
+
+         ],
+         "users_geolimits":[
+
+         ],
+         "groups_geolimits":[
+
+         ]
+      }
+   }
+]
